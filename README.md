@@ -24,7 +24,7 @@ Open the deployed site. Because the database has no users yet, it asks you to cr
 
 ## Deploying (GitHub → Cloudflare)
 
-The D1 database `wedding-enquiries` already exists and has its tables set up. Its id is in `wrangler.jsonc`.
+You don't need to set up a database by hand. On the first deploy, Wrangler creates a D1 database called `wedding-enquiries` in your Cloudflare account. The app creates its tables the first time someone opens it.
 
 1. In the Cloudflare dashboard, go to **Workers & Pages → Create → Import a repository**. Pick this GitHub repo.
 2. Leave the build command empty. The deploy command is `npx wrangler deploy`, which is the default.
@@ -36,7 +36,6 @@ To deploy from your own computer instead, run `npm install`, then `npx wrangler 
 
 - **Fails instantly with no log**: Cloudflare couldn't read the repo. In GitHub, open **Settings → Integrations → Applications → Cloudflare Workers and Pages → Configure** and make sure this repo is selected. Then click **Retry build** in Cloudflare.
 - **"name mismatch"**: the Worker in Cloudflare must be called `wedding-enquiry-tracker`, the same as `name` in `wrangler.jsonc`.
-- **D1 or authentication errors**: the Worker must be in the same Cloudflare account as the `wedding-enquiries` database.
 - **Node version errors**: `.node-version` pins Node 22, which Wrangler 4 requires.
 
 ### GitHub branches
