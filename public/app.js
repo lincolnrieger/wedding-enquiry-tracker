@@ -826,8 +826,8 @@ function openPasswordModal() {
 // Admin settings
 
 function renderAdmin() {
-  const tabs = [['fields', 'Form fields'], ['stages', 'Workflow stages'], ['users', 'Staff accounts'], ['general', 'General']];
-  const panels = { fields: adminFields, stages: adminStages, users: adminUsers, general: adminGeneral };
+  const tabs = [['fields', 'Form fields'], ['stages', 'Workflow stages'], ['users', 'Staff accounts'], ['import', 'Import'], ['general', 'General']];
+  const panels = { fields: adminFields, stages: adminStages, users: adminUsers, import: adminImport, general: adminGeneral };
   const panel = h('div', { class: 'card admin-panel' }, h('span', { class: 'muted' }, 'Loading…'));
   Promise.resolve(panels[state.adminTab]()).then((content) => panel.replaceChildren(...[content].flat(Infinity).filter(Boolean)));
   return h('div', { class: 'admin-layout' },
@@ -1115,6 +1115,137 @@ function openUserModal(user) {
   form.addEventListener('submit', (e) => { e.preventDefault(); save(); });
   modal(isNew ? 'Add account' : `Edit ${u.name}`, form,
     [h('button', { onclick: closeModal }, 'Cancel'), h('button', { class: 'primary', onclick: save }, isNew ? 'Create account' : 'Save')], { narrow: true });
+}
+
+// ---------------------------------------------------------------------------
+// Import from a spreadsheet (CSV)
+
+let importState = null; // { fileName, headers, rows, mapping }
+
+// Minimal RFC 4180 CSV parser: handles quotes, commas and line breaks inside quotes.
+function parseCsv(text) {
+  const rows = [];
+  let row = [], cell = '', quoted = false;
+  text = text.replace(/^\ufeff/, '');
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (c === '"') quoted = false;
+      else cell += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ',') { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(cell); rows.push(row); row = []; cell = '';
+    } else cell += c;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter((r) => r.some((v) => v.trim() !== ''));
+}
+
+const squash = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+
+// Guess which field a spreadsheet column belongs to from its heading.
+function guessColumn(header) {
+  const h = squash(header);
+  if (!h) return '';
+  if (h === 'stage' || h === 'status') return '_stage';
+  const fields = activeFields().filter((f) => f.type !== 'duration');
+  const exact = fields.find((f) => squash(f.label) === h || squash(f.key) === h);
+  if (exact) return exact.key;
+  const partial = fields.find((f) => {
+    const l = squash(f.label);
+    return (h.length >= 4 && l.includes(h)) || (l.length >= 4 && h.includes(l));
+  });
+  return partial ? partial.key : '';
+}
+
+function loadImportFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const all = parseCsv(String(reader.result));
+    // The heading row is the first row with at least 3 filled-in cells (skips titles above the table).
+    const headerIndex = all.findIndex((r) => r.filter((v) => v.trim()).length >= 3);
+    if (headerIndex < 0) return toast('Couldn’t find a heading row in that file.', true);
+    const headers = all[headerIndex].map((v) => v.trim());
+    const rows = all.slice(headerIndex + 1);
+    const used = new Set();
+    const mapping = headers.map((hd) => {
+      const key = guessColumn(hd);
+      if (!key || used.has(key)) return '';
+      used.add(key);
+      return key;
+    });
+    importState = { fileName: file.name, headers, rows, mapping };
+    renderApp();
+  };
+  reader.readAsText(file);
+}
+
+function adminImport() {
+  const intro = [
+    h('div', { class: 'head' }, h('h2', {}, 'Import enquiries')),
+    h('p', { class: 'muted' }, 'Bring in enquiries from a spreadsheet. In Excel or Google Sheets, save the sheet as CSV (File → Save As → CSV), then choose it below. You can check which column goes where before anything is saved.'),
+  ];
+  const picker = h('input', { type: 'file', accept: '.csv,text/csv', onchange: (e) => e.target.files[0] && loadImportFile(e.target.files[0]) });
+  if (!importState) return [...intro, picker];
+
+  const { headers, rows, mapping, fileName } = importState;
+  const fields = activeFields().filter((f) => f.type !== 'duration');
+  const options = [['', '— Don’t import —'], ['_stage', 'Stage'], ...fields.map((f) => [f.key, f.label])];
+  const preview = rows.slice(0, 3);
+  const mappedCount = mapping.filter(Boolean).length;
+  const status = h('span', { class: 'muted' });
+
+  const runImport = async (btn) => {
+    const payload = rows.map((r) => {
+      const row = { data: {} };
+      mapping.forEach((key, i) => {
+        if (!key) return;
+        if (key === '_stage') row.stage = r[i] || '';
+        else row.data[key] = r[i] ?? '';
+      });
+      return row;
+    });
+    btn.disabled = true;
+    let done = 0;
+    try {
+      for (let i = 0; i < payload.length; i += 100) {
+        status.textContent = `Importing… ${done} of ${payload.length}`;
+        const r = await api('admin/import', { method: 'POST', body: { rows: payload.slice(i, i + 100) } });
+        done += r.imported;
+      }
+      importState = null;
+      await Promise.all([refreshEnquiries(), refreshConfig()]);
+      toast(`Imported ${done} enquiries`);
+      state.view = 'list';
+      renderApp();
+    } catch (ex) {
+      btn.disabled = false;
+      status.textContent = `Stopped after ${done} of ${payload.length}: ${ex.message}`;
+    }
+  };
+
+  return [
+    ...intro,
+    h('div', { class: 'list-row' },
+      h('div', { class: 'grow' }, h('strong', {}, fileName), h('div', { class: 'muted small' }, `${rows.length} rows · ${mappedCount} columns will be imported`)),
+      h('button', { onclick: () => { importState = null; renderApp(); } }, 'Choose a different file')),
+    h('div', { class: 'table-wrap import-map', style: { marginTop: '12px' } },
+      h('table', {},
+        h('thead', {}, h('tr', {}, h('th', { class: 'nosort' }, 'Spreadsheet column'), h('th', { class: 'nosort' }, 'Goes into'), h('th', { class: 'nosort' }, 'Example values'))),
+        h('tbody', {}, headers.map((hd, i) => h('tr', { class: mapping[i] ? '' : 'skipped' },
+          h('td', {}, hd || h('span', { class: 'muted' }, `(column ${i + 1}, no heading)`)),
+          h('td', {}, h('select', {
+            onchange: (e) => { importState.mapping[i] = e.target.value; renderApp(); },
+          }, options.map(([k, label]) => h('option', { value: k, selected: mapping[i] === k }, label)))),
+          h('td', { class: 'muted small' }, preview.map((r) => r[i]).filter((v) => v && v.trim()).join(' · ').slice(0, 120))))))),
+    h('p', { class: 'muted small' }, 'Dates can be written like 26/10/2026 or 2026-10-26. Values that don’t fit their field (for example “50-60” in a number field) are kept in the first long-text field (Comments) so nothing is lost. New dropdown choices are added automatically. Rows without a Stage start in the first stage.'),
+    h('div', { style: { display: 'flex', gap: '12px', alignItems: 'center' } },
+      h('button', { class: 'primary', disabled: !mappedCount, onclick: (e) => runImport(e.target) }, `Import ${rows.length} enquiries`),
+      status),
+  ];
 }
 
 function adminGeneral() {
