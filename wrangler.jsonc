@@ -9,13 +9,16 @@
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/api/*"]
   },
+  // No database_id: `wrangler deploy` creates/reuses a D1 database called
+  // "wedding-enquiries" in whichever Cloudflare account deploys this.
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "wedding-enquiries",
-      "database_id": "58218511-c68a-4f66-98c6-6935e383ccf4",
       "migrations_dir": "migrations"
     }
   ],
+  // The .sql schema is bundled so the Worker can create its tables on first use.
+  "rules": [{ "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }],
   "observability": { "enabled": true }
 }

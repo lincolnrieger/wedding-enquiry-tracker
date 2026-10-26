@@ -1,6 +1,8 @@
 // Wedding Enquiry Tracker — Cloudflare Worker API backed by D1.
 // Static frontend lives in /public and is served by Workers Static Assets.
 
+import schemaSql from '../migrations/0001_init.sql';
+
 const SESSION_COOKIE = 'wet_session';
 const SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const PBKDF2_ITERATIONS = 100000; // Workers' maximum for PBKDF2
@@ -23,6 +25,7 @@ export default {
       return env.ASSETS.fetch(request);
     }
     try {
+      await ensureSchema(env.DB);
       return await route(request, env, url);
     } catch (err) {
       if (err instanceof HttpError) return json({ error: err.message }, err.status);
@@ -31,6 +34,31 @@ export default {
     }
   },
 };
+
+// ---------------------------------------------------------------------------
+// Schema: created automatically the first time the app runs against an empty database.
+
+let schemaReady = null;
+
+function ensureSchema(db) {
+  schemaReady ??= (async () => {
+    const exists = await db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'").first();
+    if (exists) return;
+    const statements = schemaSql
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('--'))
+      .join('\n')
+      .split(';')
+      .map((sql) => sql.replace(/\s+--[^'\n]*$/gm, '').trim())
+      .filter(Boolean)
+      .map((sql) => db.prepare(sql));
+    await db.batch(statements);
+  })().catch((err) => {
+    schemaReady = null; // retry on the next request
+    throw err;
+  });
+  return schemaReady;
+}
 
 // ---------------------------------------------------------------------------
 // Routing

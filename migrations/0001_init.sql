@@ -1,5 +1,7 @@
+-- Safe to run more than once: the Worker runs this automatically on first use.
+
 -- Users: admins can manage workflow + users, staff can manage enquiries.
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   email TEXT NOT NULL UNIQUE COLLATE NOCASE,
   name TEXT NOT NULL,
@@ -11,15 +13,15 @@ CREATE TABLE users (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   expires_at INTEGER NOT NULL
 );
-CREATE INDEX idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
 -- Pipeline stages (fully editable by admins).
-CREATE TABLE stages (
+CREATE TABLE IF NOT EXISTS stages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   color TEXT NOT NULL DEFAULT '#8a9a8b',
@@ -32,7 +34,7 @@ CREATE TABLE stages (
 -- type: text | textarea | email | phone | number | date | select | checkbox | duration
 -- options: JSON array of choices for select fields
 -- config: JSON, e.g. {"from":"date_of_enquiry","to":"booking_confirmed"} for duration fields
-CREATE TABLE fields (
+CREATE TABLE IF NOT EXISTS fields (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   key TEXT NOT NULL UNIQUE,
   label TEXT NOT NULL,
@@ -46,7 +48,7 @@ CREATE TABLE fields (
   archived INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE enquiries (
+CREATE TABLE IF NOT EXISTS enquiries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   stage_id INTEGER REFERENCES stages(id) ON DELETE SET NULL,
   data TEXT NOT NULL DEFAULT '{}',
@@ -56,9 +58,9 @@ CREATE TABLE enquiries (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX idx_enquiries_stage ON enquiries(stage_id);
+CREATE INDEX IF NOT EXISTS idx_enquiries_stage ON enquiries(stage_id);
 
-CREATE TABLE activity (
+CREATE TABLE IF NOT EXISTS activity (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   enquiry_id INTEGER NOT NULL REFERENCES enquiries(id) ON DELETE CASCADE,
   user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -66,18 +68,18 @@ CREATE TABLE activity (
   message TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX idx_activity_enquiry ON activity(enquiry_id);
+CREATE INDEX IF NOT EXISTS idx_activity_enquiry ON activity(enquiry_id);
 
 -- Default workflow, based on the original "Tracked Wedding Conversion Summary" spreadsheet.
-INSERT INTO stages (name, color, position, is_won, is_lost) VALUES
-  ('New enquiry',     '#c9a227', 1, 0, 0),
-  ('Responded',       '#7a9cc6', 2, 0, 0),
-  ('Tour booked',     '#9b7ec8', 3, 0, 0),
-  ('Toured',          '#d08c60', 4, 0, 0),
-  ('Booked',          '#5f9e6e', 5, 1, 0),
-  ('Lost / declined', '#b05a5a', 6, 0, 1);
+INSERT OR IGNORE INTO stages (id, name, color, position, is_won, is_lost) VALUES
+  (1, 'New enquiry',     '#c9a227', 1, 0, 0),
+  (2, 'Responded',       '#7a9cc6', 2, 0, 0),
+  (3, 'Tour booked',     '#9b7ec8', 3, 0, 0),
+  (4, 'Toured',          '#d08c60', 4, 0, 0),
+  (5, 'Booked',          '#5f9e6e', 5, 1, 0),
+  (6, 'Lost / declined', '#b05a5a', 6, 0, 1);
 
-INSERT INTO fields (key, label, type, options, config, section, required, show_in_list, position) VALUES
+INSERT OR IGNORE INTO fields (key, label, type, options, config, section, required, show_in_list, position) VALUES
   ('name',              'Couple name(s)',           'text',     '[]', '{}', 'Contact',  1, 1, 1),
   ('email',             'Email',                    'email',    '[]', '{}', 'Contact',  0, 1, 2),
   ('phone',             'Phone',                    'phone',    '[]', '{}', 'Contact',  0, 0, 3),
@@ -100,8 +102,8 @@ INSERT INTO fields (key, label, type, options, config, section, required, show_i
   ('deposit_paid',      'Deposit paid',             'checkbox', '[]', '{}', 'Booking',  0, 0, 17),
   ('comments',          'Comments',                 'textarea', '[]', '{}', 'Notes',    0, 0, 18);
 
-CREATE TABLE settings (
+CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-INSERT INTO settings (key, value) VALUES ('app_name', 'Wedding Enquiries');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('app_name', 'Wedding Enquiries');
