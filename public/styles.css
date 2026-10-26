@@ -251,3 +251,10 @@ td { white-space: nowrap; }
   .stat .value { font-size: 28px; }
   header.top h1 { width: 100%; }
 }
+
+/* Import column mapping: no pinned columns, and dim the columns being skipped */
+.import-map th, .import-map td { position: static !important; box-shadow: none !important; width: auto !important; min-width: 0 !important; max-width: none !important; white-space: normal; }
+.import-map tbody tr { cursor: default; }
+.import-map tr.skipped td:first-child { color: var(--muted); text-decoration: line-through; }
+.import-map select { min-width: 200px; }
+

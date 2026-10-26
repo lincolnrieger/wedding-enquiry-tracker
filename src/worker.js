@@ -135,6 +135,7 @@ async function route(request, env, url) {
     const id = sub && sub !== 'order' ? toId(sub) : null;
 
     if (resource === 'settings' && method === 'PUT') return updateSettings(request, db);
+    if (resource === 'import' && method === 'POST') return importEnquiries(request, db, user);
 
     if (resource === 'fields') {
       if (sub === 'order' && method === 'PUT') return reorder(request, db, 'fields');
@@ -700,6 +701,100 @@ async function addNote(request, db, user, id) {
   if (!message) throw new HttpError(400, 'Note cannot be empty.');
   await logActivity(db, id, user.id, 'note', message);
   return listActivity(db, id);
+}
+
+// ---------------------------------------------------------------------------
+// Admin: import from a spreadsheet (CSV rows already parsed and column-mapped in the browser)
+
+const MAX_IMPORT_ROWS = 200;
+
+// Accepts 2027-03-06, 6/3/2027, 6-3-27, 6.3.2027 (day first, as in Australia).
+function parseImportDate(raw) {
+  const s = String(raw).trim();
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  let y, mo, d;
+  if (m) [, y, mo, d] = m.map(Number);
+  else if ((m = s.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2}|\d{4})$/))) {
+    [, d, mo, y] = m.map(Number);
+    if (y < 100) y += 2000;
+  } else return null;
+  const date = new Date(Date.UTC(y, mo - 1, d));
+  if (date.getUTCMonth() !== mo - 1 || date.getUTCDate() !== d) return null;
+  return date.toISOString().slice(0, 10);
+}
+
+const squash = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+
+// Turn one raw spreadsheet cell into a stored value. Returns undefined when it can't be converted.
+function importValue(field, raw, newOptions) {
+  const s = String(raw ?? '').trim();
+  if (!s) return null;
+  switch (field.type) {
+    case 'date':
+      return parseImportDate(s) ?? undefined;
+    case 'number': {
+      const n = Number(s.replace(/,/g, ''));
+      return Number.isFinite(n) ? n : undefined;
+    }
+    case 'checkbox':
+      return /^(y|yes|true|1|x|✓|✔|done|ticked)$/i.test(s) ? true : /^(n|no|false|0)$/i.test(s) ? false : undefined;
+    case 'select': {
+      // Reuse an existing option when it only differs by case/spacing ("Bride Book" = "Bridebook"),
+      // otherwise add the new choice to the dropdown.
+      const all = [...field.options, ...(newOptions.get(field.key) || [])];
+      const match = all.find((o) => squash(o) === squash(s));
+      if (match) return match;
+      newOptions.set(field.key, [...(newOptions.get(field.key) || []), s.slice(0, 200)]);
+      return s.slice(0, 200);
+    }
+    case 'textarea':
+      return s.slice(0, 10000);
+    default:
+      return s.slice(0, 500);
+  }
+}
+
+async function importEnquiries(request, db, user) {
+  const body = await readJson(request);
+  const rows = Array.isArray(body.rows) ? body.rows : [];
+  if (!rows.length) throw new HttpError(400, 'Nothing to import.');
+  if (rows.length > MAX_IMPORT_ROWS) throw new HttpError(400, `Send at most ${MAX_IMPORT_ROWS} rows at a time.`);
+
+  const ctx = await loadWriteContext(db);
+  const fields = ctx.fields.filter((f) => f.type !== 'duration');
+  const notesField = fields.find((f) => f.type === 'textarea');
+  const newOptions = new Map();
+  const statements = [];
+
+  for (const row of rows) {
+    const raw = row && typeof row.data === 'object' && row.data ? row.data : {};
+    const data = {};
+    const leftovers = [];
+    for (const field of fields) {
+      if (!(field.key in raw)) continue;
+      const value = importValue(field, raw[field.key], newOptions);
+      if (value === undefined) leftovers.push(`${field.label}: ${String(raw[field.key]).trim()}`);
+      else if (value !== null) data[field.key] = value;
+    }
+    // Anything that didn't fit its field (e.g. "50-60" guests) is kept in the notes rather than lost.
+    if (leftovers.length && notesField) {
+      data[notesField.key] = [data[notesField.key], ...leftovers].filter(Boolean).join('\n');
+    }
+    const stageName = squash(row.stage || '');
+    const stage = (stageName && ctx.stages.find((s) => squash(s.name) === stageName)) || ctx.stages[0];
+    statements.push(
+      db.prepare('INSERT INTO enquiries (stage_id, data, created_by, updated_by) VALUES (?, ?, ?, ?)')
+        .bind(stage ? stage.id : null, JSON.stringify(data), user.id, user.id),
+      db.prepare("INSERT INTO activity (enquiry_id, user_id, kind, message) VALUES (last_insert_rowid(), ?, 'created', 'Imported from spreadsheet')")
+        .bind(user.id)
+    );
+  }
+  for (const [key, added] of newOptions) {
+    const field = fields.find((f) => f.key === key);
+    statements.push(db.prepare('UPDATE fields SET options = ? WHERE id = ?').bind(JSON.stringify([...field.options, ...added]), field.id));
+  }
+  await db.batch(statements);
+  return json({ imported: rows.length, newOptions: Object.fromEntries(newOptions) });
 }
 
 // ---------------------------------------------------------------------------
