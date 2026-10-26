@@ -20,5 +20,7 @@
   ],
   // The .sql schema is bundled so the Worker can create its tables on first use.
   "rules": [{ "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }],
+  // Run the Worker close to the database, since each request makes a few D1 calls.
+  "placement": { "mode": "smart" },
   "observability": { "enabled": true }
 }
