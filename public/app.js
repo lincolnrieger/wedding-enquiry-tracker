@@ -37,6 +37,7 @@ async function api(path, { method = 'GET', body } = {}) {
     headers: body !== undefined ? { 'content-type': 'application/json' } : {},
     body: body !== undefined ? JSON.stringify(body) : undefined,
     credentials: 'same-origin',
+    keepalive: method !== 'GET', // let a save finish even if the tab is closed straight after
   });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && path !== 'login') {
@@ -260,12 +261,17 @@ function renderSetup(appName) {
 
 function setView(view) {
   state.view = view;
-  localStorage.setItem('wet_view', view);
+  try { localStorage.setItem('wet_view', view); } catch {}
   renderApp();
+  syncFromServer({ explicit: true });
 }
 
 function renderApp() {
   if (!state.config) return renderAuth();
+  needsRender = false;
+  // Keep the cursor in the search box when the page redraws underneath it.
+  const active = document.activeElement;
+  const searchPos = active?.matches?.('main input[type=search]') ? active.selectionStart : null;
   if (state.view === 'admin' && !isAdmin()) state.view = 'list';
   const tabs = [
     ['list', 'Enquiries'],
@@ -279,7 +285,7 @@ function renderApp() {
     h('nav', { class: 'tabs' }, tabs.map(([key, label]) =>
       h('button', { class: state.view === key ? 'active' : '', onclick: () => setView(key) }, label))),
     h('div', { class: 'user-menu' },
-      h('span', { id: 'sync-status', class: 'muted small' }),
+      h('button', { id: 'sync-status', class: 'ghost sync-status', title: 'Check for changes now', onclick: () => syncFromServer({ explicit: true }) }),
       h('span', {}, me.name),
       h('span', { class: 'role-badge' }, me.role),
       h('button', { class: 'ghost', onclick: openPasswordModal }, 'Password'),
@@ -289,7 +295,84 @@ function renderApp() {
   const wide = state.view === 'list' || state.view === 'board';
   $app.replaceChildren(header, h('main', { class: wide ? 'wide' : '' }, views[state.view]()));
   updateSyncStatus();
+  if (searchPos !== null) {
+    const el = $app.querySelector('main input[type=search]');
+    el?.focus();
+    el?.setSelectionRange(searchPos, searchPos);
+  }
 }
+
+// ---------------------------------------------------------------------------
+// Live refresh: pull the latest from the database when you switch tabs, close a form,
+// finish saving, come back to the window, and every 15 seconds while the page is open —
+// so everyone using the system at once sees each other's changes.
+
+const SYNC_INTERVAL_MS = 15000;
+let lastSync = null;
+let syncing = false;
+let syncAgain = false;
+let needsRender = false;
+
+// Don't redraw under someone who is mid-way through picking from a dropdown or dragging a card.
+const isInteracting = () => dragging !== null || document.activeElement?.matches?.('main select');
+
+function mergeEnquiries(serverList) {
+  const me = state.config.me;
+  const local = new Map(state.enquiries.filter((e) => e.id != null).map((e) => [e.id, e]));
+  const serverIds = new Set(serverList.map((e) => e.id));
+  let changed = 0, byOthers = 0;
+  const next = serverList.map((s) => {
+    const mine = local.get(s.id);
+    const differs = !mine || mine.updated_at !== s.updated_at || mine.stage_id !== s.stage_id ||
+      mine.assigned_to !== s.assigned_to || JSON.stringify(mine.data) !== JSON.stringify(s.data);
+    if (!differs) return mine;
+    changed++;
+    if (s.updated_by_name !== me.name) byOthers++;
+    if (!mine) return s;
+    Object.assign(mine, s); // update in place so an open form keeps pointing at the same enquiry
+    return mine;
+  });
+  const removed = [...local.keys()].filter((id) => !serverIds.has(id)).length;
+  // Enquiries still being created (no id yet) stay at the top until their save finishes.
+  state.enquiries = [...state.enquiries.filter((e) => e.id == null), ...next];
+  return { changed: changed + removed, byOthers: byOthers + removed };
+}
+
+async function syncFromServer({ explicit = false } = {}) {
+  if (!state.config) return;
+  // Never overwrite changes that are still on their way to the database; sync once they land.
+  if (syncing || pendingSaves) { syncAgain = true; return; }
+  syncing = true;
+  updateSyncStatus();
+  try {
+    const [config, list] = await Promise.all([api('config'), api('enquiries')]);
+    if (pendingSaves) { syncAgain = true; return; }
+    const configChanged = JSON.stringify(config) !== JSON.stringify(state.config);
+    if (configChanged) {
+      state.config = config;
+      document.title = config.appName;
+    }
+    const { changed, byOthers } = mergeEnquiries(list.enquiries);
+    lastSync = new Date();
+    if (byOthers && !explicit) toast(`${byOthers} update${byOthers === 1 ? '' : 's'} from others`);
+    // Admin forms are only redrawn when you click into them, so background refreshes never wipe typing.
+    const canRedraw = explicit || state.view !== 'admin';
+    if ((changed || configChanged || needsRender) && canRedraw) {
+      if (isInteracting()) needsRender = true;
+      else renderApp();
+    }
+  } catch {
+    // Offline or signed out: api() already handles sign-out; just try again next time.
+  } finally {
+    syncing = false;
+    updateSyncStatus();
+    if (syncAgain && !pendingSaves) { syncAgain = false; syncFromServer(); }
+  }
+}
+
+setInterval(() => { if (document.visibilityState === 'visible') syncFromServer(); }, SYNC_INTERVAL_MS);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncFromServer(); });
+window.addEventListener('focus', () => syncFromServer());
 
 // ---------------------------------------------------------------------------
 // Background saving: the screen updates instantly and the database catches up behind it.
@@ -301,10 +384,16 @@ let pendingSaves = 0;
 
 function updateSyncStatus() {
   const el = document.getElementById('sync-status');
-  if (el) el.textContent = pendingSaves ? 'Saving…' : '';
+  if (!el) return;
+  const time = lastSync?.toLocaleTimeString('en-AU', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+  el.textContent = pendingSaves ? 'Saving…' : syncing ? 'Checking for updates…' : lastSync ? `✓ Up to date · ${time}` : '';
+  el.classList.toggle('busy', !!(pendingSaves || syncing));
 }
 
+let flushOpenForm = null; // saves whatever is typed in an open enquiry form right now
+
 window.addEventListener('beforeunload', (e) => {
+  flushOpenForm?.();
   if (pendingSaves) e.preventDefault();
 });
 
@@ -313,14 +402,17 @@ function queueSave(enquiry, task) {
   queuedCount.set(enquiry, (queuedCount.get(enquiry) || 0) + 1);
   pendingSaves++;
   updateSyncStatus();
-  const run = prev.then(task).catch(async (ex) => {
+  const run = prev.then(task).catch((ex) => {
     toast(`Couldn't save: ${ex.message}`, true);
-    await refreshEnquiries().catch(() => {});
-    renderApp();
+    // A new enquiry that failed to save is taken back off the screen; the refresh below restores the rest.
+    if (enquiry.id == null) state.enquiries = state.enquiries.filter((e) => e !== enquiry);
+    syncAgain = true;
+    needsRender = true;
   }).finally(() => {
     queuedCount.set(enquiry, queuedCount.get(enquiry) - 1);
     pendingSaves--;
     updateSyncStatus();
+    if (!pendingSaves) syncFromServer(); // every save is followed by a fresh read from the database
   });
   saveQueues.set(enquiry, run);
   return run;
@@ -393,7 +485,7 @@ function toolbar(extra) {
   return h('div', { class: 'toolbar' },
     search, stageSel, h('div', { class: 'grow' }), extra,
     h('button', { onclick: exportCsv }, 'Export CSV'),
-    h('button', { class: 'primary', onclick: () => openEnquiry(null) }, '+ Add new enquiry'));
+    h('button', { class: 'primary', onclick: () => openEnquiry(null) }, loadDraft() ? '+ Resume draft enquiry' : '+ Add new enquiry'));
 }
 
 function renderList() {
@@ -459,7 +551,10 @@ function tickChip(enquiry, field) {
   const on = !!enquiry.data[field.key];
   return h('button', {
     type: 'button', class: 'tick-chip' + (on ? ' on' : ''), title: on ? `Untick “${field.label}”` : `Tick “${field.label}”`,
-    onclick: () => quickUpdate(enquiry, { data: { [field.key]: !on } }),
+    onclick: (ev) => {
+      ev.stopPropagation(); // on the board, ticking shouldn't also open the enquiry
+      quickUpdate(enquiry, { data: { [field.key]: !on } });
+    },
   }, (on ? '✓ ' : '') + field.label);
 }
 
@@ -488,6 +583,7 @@ function renderBoard() {
       h('div', {
         class: 'board-card', draggable: 'true',
         ondragstart: (ev) => { dragging = e; ev.dataTransfer.setData('text/plain', ''); },
+        ondragend: () => { dragging = null; if (needsRender) renderApp(); },
         onclick: () => openEnquiry(e),
       },
         h('div', { class: 'title' }, titleOf(e)),
@@ -495,8 +591,7 @@ function renderBoard() {
           const v = displayValue(f, e.data);
           return v !== '' ? h('span', {}, `${f.label}: ${v}`) : null;
         })),
-        ticks.length ? h('div', { class: 'ticks' }, ticks.map((f) =>
-          h('span', { class: 'tick-chip' + (e.data[f.key] ? ' on' : '') }, (e.data[f.key] ? '✓ ' : '') + f.label))) : null)));
+        ticks.length ? h('div', { class: 'ticks' }, ticks.map((f) => tickChip(e, f))) : null)));
     const col = h('div', { class: 'column' },
       h('div', { class: 'column-head' }, h('span', { class: 'dot pill', style: { background: stage.color, width: '10px', height: '10px', padding: 0 } }), stage.name, h('span', { class: 'count' }, items.length)),
       body);
@@ -579,27 +674,95 @@ function renderSummary() {
     return [new Date(y, mo - 1, 1).toLocaleDateString('en-AU', { month: 'short', year: 'numeric' }), byMonth[m]];
   })));
 
-  return h('div', {}, h('div', { class: 'stats' }, tiles), h('div', { class: 'summary-grid' }, panels));
+  return h('div', {}, h('div', { class: 'stats' }, tiles), funnelPanel(all, stages), h('div', { class: 'summary-grid' }, panels));
+}
+
+// How far enquiries get through the workflow, and where the lost ones dropped out.
+// Uses every stage each enquiry has been in, so "Toured → Lost" and "Booked → Lost" are told apart.
+function funnelPanel(all, stages) {
+  const flow = stages.filter((s) => !s.is_lost);
+  if (!flow.length || !all.length) return null;
+  const lostIds = new Set(stages.filter((s) => s.is_lost).map((s) => s.id));
+  // Index (in flow order) of the furthest non-lost stage an enquiry has reached. Every enquiry counts as reaching the first.
+  const furthest = (e) => {
+    const seen = new Set([...(e.stage_history || []), e.stage_id]);
+    let best = 0;
+    flow.forEach((s, i) => { if (seen.has(s.id)) best = Math.max(best, i); });
+    return best;
+  };
+  const reachedIdx = all.map(furthest);
+  const reached = flow.map((_, i) => reachedIdx.filter((r) => r >= i).length);
+  const lostAfter = flow.map((_, i) => all.filter((e, k) => lostIds.has(e.stage_id) && reachedIdx[k] === i).length);
+  const pct = (a, b) => (b ? Math.round((a / b) * 100) + '%' : '—');
+
+  return h('div', { class: 'card funnel' },
+    h('h3', {}, 'Conversion & drop-off'),
+    h('p', { class: 'muted small' }, 'How many enquiries reached each step, how many moved on to the next one, and how many were lost after it. Based on every stage an enquiry has been in, so an enquiry that toured and was then lost counts as “lost after Toured”.'),
+    h('div', { class: 'table-wrap funnel-table' }, h('table', {},
+      h('thead', {}, h('tr', {},
+        h('th', { class: 'nosort' }, 'Step'), h('th', { class: 'nosort' }, 'Reached'), h('th', { class: 'nosort' }, '% of all enquiries'),
+        h('th', { class: 'nosort' }, 'Went on to next step'), h('th', { class: 'nosort' }, 'Lost after this step'))),
+      h('tbody', {}, flow.map((s, i) => h('tr', {},
+        h('td', {}, stagePill(s)),
+        h('td', {}, h('div', { class: 'funnel-bar' },
+          h('div', { class: 'bar' }, h('span', { style: { width: (reached[i] / all.length) * 100 + '%', background: s.color } })),
+          h('strong', {}, reached[i]))),
+        h('td', {}, pct(reached[i], all.length)),
+        h('td', {}, i < flow.length - 1 ? `${pct(reached[i + 1], reached[i])} → ${flow[i + 1].name}` : '—'),
+        h('td', { class: lostAfter[i] ? 'lost' : 'muted' }, lostAfter[i] ? `${lostAfter[i]} (${pct(lostAfter[i], reached[i])})` : '0')))))));
 }
 
 // ---------------------------------------------------------------------------
 // Enquiry modal (add + edit)
 
-function closeModal() {
-  document.querySelector('.overlay')?.remove();
-  document.removeEventListener('keydown', escClose);
-}
-function escClose(e) { if (e.key === 'Escape') closeModal(); }
+// A guard can stop a form closing (e.g. to ask about unsaved changes). Return false to keep it open.
+let modalGuard = null;
 
-function modal(title, body, footer, { narrow = false, headExtra } = {}) {
-  closeModal();
+function closeModal(force = false) {
+  const overlay = document.querySelector('.overlay');
+  if (!overlay) return;
+  if (!force && modalGuard && modalGuard() === false) return;
+  modalGuard = null;
+  flushOpenForm = null;
+  overlay.remove();
+  document.removeEventListener('keydown', escClose);
+  syncFromServer(); // closing a form always pulls the latest from the database
+}
+function escClose(e) {
+  if (e.key === 'Escape' && !document.querySelector('.choice-overlay')) closeModal();
+}
+
+// A small "what would you like to do?" box on top of a form. Resolves with the chosen value (null = cancel).
+function choiceDialog(title, text, choices) {
+  return new Promise((resolve) => {
+    const done = (value) => {
+      box.remove();
+      document.removeEventListener('keydown', onKey, true);
+      resolve(value);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); done(null); } };
+    const box = h('div', { class: 'choice-overlay' },
+      h('div', { class: 'modal narrow', role: 'alertdialog' },
+        h('div', { class: 'modal-head' }, h('h2', {}, title)),
+        h('div', { class: 'modal-body' }, h('p', { style: { margin: 0 } }, text)),
+        h('div', { class: 'modal-foot' }, choices.map(([label, value, cls]) =>
+          h('button', { class: cls || '', onclick: () => done(value) }, label)))));
+    document.body.append(box);
+    document.addEventListener('keydown', onKey, true);
+    box.querySelector('button.primary, button')?.focus();
+  });
+}
+
+function modal(title, body, footer, { narrow = false, headExtra, guard = null } = {}) {
+  closeModal(true);
   const overlay = h('div', { class: 'overlay', onmousedown: (e) => { if (e.target === overlay) closeModal(); } },
     h('div', { class: 'modal' + (narrow ? ' narrow' : ''), role: 'dialog', 'aria-modal': 'true' },
-      h('div', { class: 'modal-head' }, h('h2', {}, title), headExtra, h('button', { class: 'ghost icon', onclick: closeModal, 'aria-label': 'Close' }, '✕')),
+      h('div', { class: 'modal-head' }, h('h2', {}, title), headExtra, h('button', { class: 'ghost icon', onclick: () => closeModal(), 'aria-label': 'Close' }, '✕')),
       h('div', { class: 'modal-body' }, body),
       footer ? h('div', { class: 'modal-foot' }, footer) : null));
   document.body.append(overlay);
   document.addEventListener('keydown', escClose);
+  modalGuard = guard;
   overlay.querySelector('input, select, textarea')?.focus();
   return overlay;
 }
@@ -632,14 +795,44 @@ function fieldInput(field, value, data) {
   }
 }
 
+// Unsaved new-enquiry drafts live in this browser until they're added or discarded,
+// so closing the form, refreshing or even closing the tab never loses what was typed.
+const draftKey = () => `wet_draft_${state.config.me.id}`;
+function loadDraft() {
+  try { return JSON.parse(localStorage.getItem(draftKey())); } catch { return null; }
+}
+function storeDraft(body) {
+  try { localStorage.setItem(draftKey(), JSON.stringify({ body, savedAt: Date.now() })); } catch {}
+}
+function clearDraft() {
+  try { localStorage.removeItem(draftKey()); } catch {}
+}
+
+const requiredMissing = (body) =>
+  activeFields().find((f) => f.required && (body.data[f.key] === '' || body.data[f.key] === false || body.data[f.key] == null));
+
+// Only the fields that actually changed, so two people editing different parts of the same enquiry don't overwrite each other.
+function diffBody(before, after) {
+  const diff = {};
+  const data = {};
+  for (const [k, v] of Object.entries(after.data)) if (before.data[k] !== v) data[k] = v;
+  if (Object.keys(data).length) diff.data = data;
+  if (before.stage_id !== after.stage_id) diff.stage_id = after.stage_id;
+  if (before.assigned_to !== after.assigned_to) diff.assigned_to = after.assigned_to;
+  return Object.keys(diff).length ? diff : null;
+}
+
 function openEnquiry(enquiry) {
   const isNew = !enquiry;
-  const data = enquiry ? { ...enquiry.data } : {};
-  if (isNew) {
-    // Pre-fill the first date field (usually "Date of enquiry") with today.
-    const firstDate = activeFields().find((f) => f.type === 'date');
-    if (firstDate) data[firstDate.key] = new Date().toLocaleDateString('en-CA');
-  }
+  const draft = isNew ? loadDraft() : null;
+  const firstDate = activeFields().find((f) => f.type === 'date');
+  const today = new Date().toLocaleDateString('en-CA');
+  let data;
+  if (enquiry) data = { ...enquiry.data };
+  else if (draft) data = { ...draft.body.data };
+  else data = firstDate ? { [firstDate.key]: today } : {}; // pre-fill "Date of enquiry" with today
+  const stageId = enquiry ? enquiry.stage_id : draft?.body.stage_id ?? state.config.stages[0]?.id;
+  const assignedTo = enquiry ? enquiry.assigned_to : draft?.body.assigned_to ?? null;
 
   const sections = [];
   for (const f of activeFields()) {
@@ -649,15 +842,17 @@ function openEnquiry(enquiry) {
   }
 
   const err = h('div', { class: 'error hidden' });
+  const showErr = (msg) => { err.textContent = msg; err.classList.remove('hidden'); };
+  const hideErr = () => err.classList.add('hidden');
   const form = h('form', { style: { display: 'flex', flexDirection: 'column', gap: '20px' } },
     h('div', { class: 'form-grid' },
       h('label', { class: 'field' }, 'Stage',
         h('select', { name: 'stage_id' }, state.config.stages.map((s) =>
-          h('option', { value: s.id, selected: enquiry ? s.id === enquiry.stage_id : s === state.config.stages[0] }, s.name)))),
+          h('option', { value: s.id, selected: s.id === stageId }, s.name)))),
       h('label', { class: 'field' }, 'Assigned to',
         h('select', { name: 'assigned_to' }, h('option', { value: '' }, '— Nobody —'),
-          state.config.users.filter((u) => u.active || u.id === enquiry?.assigned_to).map((u) =>
-            h('option', { value: u.id, selected: enquiry?.assigned_to === u.id }, u.name))))),
+          state.config.users.filter((u) => u.active || u.id === assignedTo).map((u) =>
+            h('option', { value: u.id, selected: assignedTo === u.id }, u.name))))),
     sections.map((sec) => h('div', { class: 'form-section' },
       h('h3', {}, sec.name),
       h('div', { class: 'form-grid' }, sec.fields.map((f) =>
@@ -667,60 +862,157 @@ function openEnquiry(enquiry) {
     err);
 
   // Keep calculated durations live as dates change.
-  form.addEventListener('input', () => {
+  const refreshDurations = () => {
     const current = readForm(form).data;
     for (const el of form.querySelectorAll('[data-duration]')) {
       const f = activeFields().find((x) => x.key === el.dataset.duration);
       el.textContent = fmtDuration(durationValue(f, current)) || 'Calculated automatically';
     }
-  });
+  };
+  const status = h('span', { class: 'save-state muted small' });
+  let timer = null;
 
-  const save = () => {
-    err.classList.add('hidden');
+  if (!isNew) {
+    // ---- Existing enquiry: every change saves by itself (as you type, and the moment you click away).
+    let lastSaved = readForm(form);
+    status.textContent = '✓ All changes saved';
+    const autosave = () => {
+      clearTimeout(timer);
+      timer = null;
+      const current = readForm(form);
+      const diff = diffBody(lastSaved, current);
+      if (!diff) return true;
+      const missing = requiredMissing(current);
+      if (missing) {
+        showErr(`"${missing.label}" is required, so this change isn't saved yet.`);
+        status.textContent = 'Not saved yet';
+        return false;
+      }
+      hideErr();
+      lastSaved = current;
+      applyLocal(enquiry, diff);
+      status.textContent = 'Saving…';
+      queueSave(enquiry, async () => {
+        const { enquiry: saved } = await api(`enquiries/${enquiry.id}`, { method: 'PATCH', body: diff });
+        settle(enquiry, saved);
+      }).then(() => { if (!timer && status.textContent === 'Saving…') status.textContent = '✓ All changes saved'; });
+      if (!isInteracting()) renderApp(); else needsRender = true;
+      return true;
+    };
+    flushOpenForm = autosave;
+    form.addEventListener('input', () => {
+      refreshDurations();
+      status.textContent = 'Editing…';
+      clearTimeout(timer);
+      timer = setTimeout(autosave, 800);
+    });
+    form.addEventListener('change', autosave); // fires when you tick, pick, or click out of a box
+    form.addEventListener('submit', (e) => { e.preventDefault(); autosave(); });
+
+    const guard = () => {
+      if (autosave()) return true;
+      choiceDialog('Some changes aren\u2019t saved', `${err.textContent} Close without saving them?`, [
+        ['Keep editing', null, 'primary'],
+        ['Close without saving', 'discard', 'danger'],
+      ]).then((choice) => { if (choice === 'discard') closeModal(true); });
+      return false;
+    };
+    const footer = [
+      isAdmin() ? h('button', { class: 'danger left', onclick: () => deleteEnquiry(enquiry) }, 'Delete') : null,
+      h('span', { class: 'muted small left' }, `Added by ${enquiry.created_by_name || 'unknown'} · ${fmtDateTime(enquiry.created_at)}`),
+      status,
+      h('button', { class: 'primary', onclick: () => closeModal() }, 'Done'),
+    ];
+    modal(titleOf(enquiry), [form, activityPanel(enquiry)], footer, { headExtra: stagePill(stageById(enquiry.stage_id)), guard });
+    return;
+  }
+
+  // ---- New enquiry: kept as a draft in this browser until it's added, so nothing typed is ever lost.
+  const blank = (() => {
+    const body = { data: {}, stage_id: state.config.stages[0]?.id ?? null, assigned_to: null };
+    for (const f of activeFields()) {
+      if (f.type === 'duration') continue;
+      body.data[f.key] = f.type === 'checkbox' ? false : f === firstDate ? today : '';
+    }
+    return JSON.stringify(body);
+  })();
+  const isDirty = () => JSON.stringify(readForm(form)) !== blank;
+  const saveDraft = () => {
+    clearTimeout(timer);
+    timer = null;
+    if (isDirty()) {
+      storeDraft(readForm(form));
+      status.textContent = '✓ Draft saved';
+    } else clearDraft();
+  };
+  flushOpenForm = saveDraft;
+  form.addEventListener('input', () => {
+    refreshDurations();
+    clearTimeout(timer);
+    timer = setTimeout(saveDraft, 400);
+  });
+  form.addEventListener('change', saveDraft);
+
+  const create = () => {
+    hideErr();
     const body = readForm(form);
-    const missing = activeFields().find((f) => f.required && (body.data[f.key] === '' || body.data[f.key] === false));
+    const missing = requiredMissing(body);
     if (missing) {
-      err.textContent = `"${missing.label}" is required.`;
-      err.classList.remove('hidden');
+      showErr(`"${missing.label}" is required.`);
       err.scrollIntoView({ block: 'nearest' });
-      return;
+      return false;
     }
     // Update the screen straight away; the database save happens in the background.
-    if (isNew) {
-      const draft = {
-        id: null, stage_id: body.stage_id ?? state.config.stages[0]?.id ?? null, assigned_to: body.assigned_to, data: {},
-        created_by_name: state.config.me.name, created_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
-      };
-      applyLocal(draft, body);
-      state.enquiries.unshift(draft);
-      queueSave(draft, async () => {
-        const { enquiry: created } = await api('enquiries', { method: 'POST', body });
-        settle(draft, created);
-      });
-      toast('Enquiry added');
-    } else {
-      applyLocal(enquiry, body);
-      queueSave(enquiry, async () => {
-        const { enquiry: saved } = await api(`enquiries/${enquiry.id}`, { method: 'PUT', body });
-        settle(enquiry, saved);
-      });
-      toast('Changes saved');
-    }
-    closeModal();
+    const created = {
+      id: null, stage_id: body.stage_id ?? state.config.stages[0]?.id ?? null, assigned_to: body.assigned_to, data: {},
+      stage_history: [], created_by_name: state.config.me.name, created_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    };
+    applyLocal(created, body);
+    state.enquiries.unshift(created);
+    queueSave(created, async () => {
+      const { enquiry: saved } = await api('enquiries', { method: 'POST', body });
+      settle(created, saved);
+    });
+    clearDraft();
+    toast('Enquiry added');
+    closeModal(true);
     renderApp();
+    return true;
   };
-  form.addEventListener('submit', (e) => { e.preventDefault(); save(); });
+  form.addEventListener('submit', (e) => { e.preventDefault(); create(); });
 
-  const body = [form];
-  if (!isNew) body.push(activityPanel(enquiry));
+  const guard = () => {
+    if (!isDirty()) { clearDraft(); return true; }
+    saveDraft();
+    choiceDialog('Save this enquiry?', 'You\u2019ve started filling this in. What would you like to do?', [
+      ['Keep editing', null, 'ghost left'],
+      ['Discard', 'discard', 'danger'],
+      ['Keep as draft', 'draft'],
+      ['Add enquiry', 'add', 'primary'],
+    ]).then((choice) => {
+      if (choice === 'add') create();
+      else if (choice === 'draft') {
+        closeModal(true);
+        renderApp();
+        toast('Draft kept. Click “Resume draft enquiry” to carry on.');
+      } else if (choice === 'discard') {
+        clearDraft();
+        closeModal(true);
+        renderApp();
+      }
+    });
+    return false;
+  };
 
+  const restored = draft ? h('div', { class: 'draft-banner' },
+    h('span', {}, `Carrying on from your unsaved draft (${new Date(draft.savedAt).toLocaleString('en-AU', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}).`),
+    h('button', { type: 'button', class: 'ghost', onclick: () => { clearDraft(); closeModal(true); openEnquiry(null); } }, 'Start a fresh one instead')) : null;
   const footer = [
-    !isNew && isAdmin() ? h('button', { class: 'danger left', onclick: () => deleteEnquiry(enquiry) }, 'Delete') : null,
-    !isNew ? h('span', { class: 'muted small left' }, `Added by ${enquiry.created_by_name || 'unknown'} · ${fmtDateTime(enquiry.created_at)}`) : null,
-    h('button', { onclick: closeModal }, 'Cancel'),
-    h('button', { class: 'primary', onclick: save }, isNew ? 'Add enquiry' : 'Save changes'),
+    status,
+    h('button', { onclick: () => closeModal() }, 'Cancel'),
+    h('button', { class: 'primary', onclick: create }, 'Add enquiry'),
   ];
-  modal(isNew ? 'New enquiry' : titleOf(enquiry), body, footer, { headExtra: enquiry ? stagePill(stageById(enquiry.stage_id)) : null });
+  modal('New enquiry', [restored, form], footer, { guard });
 }
 
 function readForm(form) {
@@ -767,7 +1059,7 @@ function activityPanel(enquiry) {
 function deleteEnquiry(enquiry) {
   if (!confirm(`Delete "${titleOf(enquiry)}"? This can't be undone.`)) return;
   state.enquiries = state.enquiries.filter((e) => e !== enquiry);
-  closeModal();
+  closeModal(true);
   renderApp();
   toast('Enquiry deleted');
   queueSave(enquiry, () => api(`enquiries/${enquiry.id}`, { method: 'DELETE', body: {} }));
@@ -819,7 +1111,7 @@ function openPasswordModal() {
     } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
   };
   form.addEventListener('submit', (e) => { e.preventDefault(); save(); });
-  modal('Change password', form, [h('button', { onclick: closeModal }, 'Cancel'), h('button', { class: 'primary', onclick: save }, 'Change password')], { narrow: true });
+  modal('Change password', form, [h('button', { onclick: () => closeModal() }, 'Cancel'), h('button', { class: 'primary', onclick: save }, 'Change password')], { narrow: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -955,7 +1247,7 @@ function openFieldModal(field) {
   };
   form.addEventListener('submit', (e) => { e.preventDefault(); save(); });
   modal(isNew ? 'Add field' : `Edit “${f.label}”`, form,
-    [h('button', { onclick: closeModal }, 'Cancel'), h('button', { class: 'primary', onclick: save }, isNew ? 'Add field' : 'Save')]);
+    [h('button', { onclick: () => closeModal() }, 'Cancel'), h('button', { class: 'primary', onclick: save }, isNew ? 'Add field' : 'Save')]);
 }
 
 function adminStages() {
@@ -997,7 +1289,7 @@ function openStageModal(stage) {
   };
   form.addEventListener('submit', (e) => { e.preventDefault(); save(); });
   modal(isNew ? 'Add stage' : `Edit “${s.name}”`, form,
-    [h('button', { onclick: closeModal }, 'Cancel'), h('button', { class: 'primary', onclick: save }, 'Save')], { narrow: true });
+    [h('button', { onclick: () => closeModal() }, 'Cancel'), h('button', { class: 'primary', onclick: save }, 'Save')], { narrow: true });
 }
 
 function deleteStage(stage) {
@@ -1016,7 +1308,7 @@ function deleteStage(stage) {
   const sel = h('select', {}, others.map((s) => h('option', { value: s.id }, s.name)));
   modal(`Delete “${stage.name}”`,
     [h('p', {}, `${count} enquir${count === 1 ? 'y is' : 'ies are'} in this stage. Move them to:`), sel],
-    [h('button', { onclick: closeModal }, 'Cancel'), h('button', { class: 'danger', onclick: () => run(sel.value) }, 'Move & delete')],
+    [h('button', { onclick: () => closeModal() }, 'Cancel'), h('button', { class: 'danger', onclick: () => run(sel.value) }, 'Move & delete')],
     { narrow: true });
 }
 
@@ -1114,7 +1406,7 @@ function openUserModal(user) {
   };
   form.addEventListener('submit', (e) => { e.preventDefault(); save(); });
   modal(isNew ? 'Add account' : `Edit ${u.name}`, form,
-    [h('button', { onclick: closeModal }, 'Cancel'), h('button', { class: 'primary', onclick: save }, isNew ? 'Create account' : 'Save')], { narrow: true });
+    [h('button', { onclick: () => closeModal() }, 'Cancel'), h('button', { class: 'primary', onclick: save }, isNew ? 'Create account' : 'Save')], { narrow: true });
 }
 
 // ---------------------------------------------------------------------------

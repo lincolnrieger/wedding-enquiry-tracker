@@ -3,6 +3,7 @@
 
 import initSql from '../migrations/0001_init.sql';
 import invitesSql from '../migrations/0002_invites.sql';
+import stageHistorySql from '../migrations/0003_stage_history.sql';
 
 const SESSION_COOKIE = 'wet_session';
 const SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000;
@@ -40,9 +41,11 @@ export default {
 // ---------------------------------------------------------------------------
 // Schema: each migration runs automatically the first time the app starts without its table.
 
+// Each migration runs once: when its table (or table.column) doesn't exist yet.
 const MIGRATIONS = [
   { table: 'settings', sql: initSql },
   { table: 'invites', sql: invitesSql },
+  { table: 'enquiries', column: 'stage_history', sql: stageHistorySql },
 ];
 
 let schemaReady = null;
@@ -62,8 +65,12 @@ function ensureSchema(db) {
     const { results } = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
     const tables = new Set(results.map((r) => r.name));
     for (const m of MIGRATIONS) {
-      if (tables.has(m.table)) continue;
+      if (m.column) {
+        const cols = await db.prepare('SELECT name FROM pragma_table_info(?)').bind(m.table).all();
+        if (cols.results.some((c) => c.name === m.column)) continue;
+      } else if (tables.has(m.table)) continue;
       await db.batch(sqlStatements(m.sql).map((sql) => db.prepare(sql)));
+      tables.add(m.table);
     }
   })().catch((err) => {
     schemaReady = null; // retry on the next request
@@ -490,6 +497,7 @@ function rowToEnquiry(row) {
     stage_id: row.stage_id,
     assigned_to: row.assigned_to,
     data: parseJson(row.data, {}),
+    stage_history: parseJson(row.stage_history, []),
     created_by_name: row.created_by_name,
     updated_by_name: row.updated_by_name,
     created_at: row.created_at,
@@ -564,6 +572,11 @@ function mergeData(fields, existing, incoming, partial) {
   return data;
 }
 
+function withStage(history, stageId) {
+  const list = Array.isArray(history) ? history : [];
+  return stageId && !list.includes(stageId) ? [...list, stageId] : list;
+}
+
 // Load everything an enquiry write needs in a single database round trip.
 async function loadWriteContext(db, enquiryId) {
   const statements = [
@@ -614,8 +627,8 @@ async function createEnquiry(request, db, user) {
   const assignee = pickUser(ctx, body.assigned_to);
   // Insert the enquiry and its first history entry together (one round trip, one transaction).
   const [inserted] = await db.batch([
-    db.prepare('INSERT INTO enquiries (stage_id, data, assigned_to, created_by, updated_by) VALUES (?, ?, ?, ?, ?) RETURNING *')
-      .bind(stageId, JSON.stringify(data), assignee, user.id, user.id),
+    db.prepare('INSERT INTO enquiries (stage_id, data, assigned_to, created_by, updated_by, stage_history) VALUES (?, ?, ?, ?, ?, ?) RETURNING *')
+      .bind(stageId, JSON.stringify(data), assignee, user.id, user.id, JSON.stringify(stageId ? [stageId] : [])),
     db.prepare("INSERT INTO activity (enquiry_id, user_id, kind, message) VALUES (last_insert_rowid(), ?, 'created', 'Enquiry created')")
       .bind(user.id),
   ]);
@@ -658,8 +671,8 @@ async function updateEnquiry(request, db, user, id, partial) {
   // Save the change and its history entry together (one round trip, one transaction).
   const [updated] = await db.batch([
     db.prepare(
-      "UPDATE enquiries SET data = ?, stage_id = ?, assigned_to = ?, updated_by = ?, updated_at = datetime('now') WHERE id = ? RETURNING *"
-    ).bind(JSON.stringify(data), stageId, assignee, user.id, id),
+      "UPDATE enquiries SET data = ?, stage_id = ?, assigned_to = ?, stage_history = ?, updated_by = ?, updated_at = datetime('now') WHERE id = ? RETURNING *"
+    ).bind(JSON.stringify(data), stageId, assignee, JSON.stringify(withStage(existing.stage_history, stageId)), user.id, id),
     db.prepare("INSERT INTO activity (enquiry_id, user_id, kind, message) VALUES (?, ?, 'updated', ?)")
       .bind(id, user.id, changes.join('\n')),
   ]);
@@ -783,8 +796,8 @@ async function importEnquiries(request, db, user) {
     const stageName = squash(row.stage || '');
     const stage = (stageName && ctx.stages.find((s) => squash(s.name) === stageName)) || ctx.stages[0];
     statements.push(
-      db.prepare('INSERT INTO enquiries (stage_id, data, created_by, updated_by) VALUES (?, ?, ?, ?)')
-        .bind(stage ? stage.id : null, JSON.stringify(data), user.id, user.id),
+      db.prepare('INSERT INTO enquiries (stage_id, data, created_by, updated_by, stage_history) VALUES (?, ?, ?, ?, ?)')
+        .bind(stage ? stage.id : null, JSON.stringify(data), user.id, user.id, JSON.stringify(stage ? [stage.id] : [])),
       db.prepare("INSERT INTO activity (enquiry_id, user_id, kind, message) VALUES (last_insert_rowid(), ?, 'created', 'Imported from spreadsheet')")
         .bind(user.id)
     );
@@ -934,7 +947,15 @@ async function deleteStage(db, id, url) {
     if (!moveTo) throw new HttpError(409, `${used.n} enquiries are in this stage. Choose where to move them.`);
     const target = await resolveStage(db, moveTo);
     if (target === id) throw new HttpError(400, 'Choose a different stage to move enquiries to.');
-    await db.prepare('UPDATE enquiries SET stage_id = ? WHERE stage_id = ?').bind(target, id).run();
+    await db
+      .prepare(
+        `UPDATE enquiries SET stage_id = ?,
+           stage_history = CASE WHEN EXISTS (SELECT 1 FROM json_each(stage_history) WHERE value = ?)
+             THEN stage_history ELSE json_insert(stage_history, '$[#]', ?) END
+         WHERE stage_id = ?`
+      )
+      .bind(target, target, target, id)
+      .run();
   }
   await db.prepare('DELETE FROM stages WHERE id = ?').bind(id).run();
   return json({ stages: await loadStages(db) });
