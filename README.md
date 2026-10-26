@@ -32,6 +32,17 @@ The D1 database `wedding-enquiries` already exists and has its tables set up. It
 
 To deploy from your own computer instead, run `npm install`, then `npx wrangler login`, then `npm run deploy`.
 
+### If a Cloudflare build fails
+
+- **Fails instantly with no log**: Cloudflare couldn't read the repo. In GitHub, open **Settings → Integrations → Applications → Cloudflare Workers and Pages → Configure** and make sure this repo is selected. Then click **Retry build** in Cloudflare.
+- **"name mismatch"**: the Worker in Cloudflare must be called `wedding-enquiry-tracker`, the same as `name` in `wrangler.jsonc`.
+- **D1 or authentication errors**: the Worker must be in the same Cloudflare account as the `wedding-enquiries` database.
+- **Node version errors**: `.node-version` pins Node 22, which Wrangler 4 requires.
+
+### GitHub branches
+
+`main` is the branch Cloudflare deploys. Make it the default branch in GitHub under **Settings → General → Default branch**. Changes are made on another branch and merged into `main` with a pull request. Each merge redeploys the site.
+
 ### Database changes
 
 All the customisation (fields, stages, accounts) is stored as data, so day-to-day changes never need a database migration. If a developer later adds a file to `migrations/`, apply it with `npm run db:migrate`.
