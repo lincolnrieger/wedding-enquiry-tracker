@@ -1,13 +1,15 @@
 // Wedding Enquiry Tracker — Cloudflare Worker API backed by D1.
 // Static frontend lives in /public and is served by Workers Static Assets.
 
-import schemaSql from '../migrations/0001_init.sql';
+import initSql from '../migrations/0001_init.sql';
+import invitesSql from '../migrations/0002_invites.sql';
 
 const SESSION_COOKIE = 'wet_session';
 const SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const PBKDF2_ITERATIONS = 100000; // Workers' maximum for PBKDF2
 const MAX_FAILED_LOGINS = 5;
 const LOCKOUT_MS = 15 * 60 * 1000;
+const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 const FIELD_TYPES = ['text', 'textarea', 'email', 'phone', 'number', 'date', 'select', 'checkbox', 'duration'];
 
@@ -36,23 +38,33 @@ export default {
 };
 
 // ---------------------------------------------------------------------------
-// Schema: created automatically the first time the app runs against an empty database.
+// Schema: each migration runs automatically the first time the app starts without its table.
+
+const MIGRATIONS = [
+  { table: 'settings', sql: initSql },
+  { table: 'invites', sql: invitesSql },
+];
 
 let schemaReady = null;
 
+function sqlStatements(text) {
+  return text
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('--'))
+    .join('\n')
+    .split(';')
+    .map((sql) => sql.replace(/\s+--[^'\n]*$/gm, '').trim())
+    .filter(Boolean);
+}
+
 function ensureSchema(db) {
   schemaReady ??= (async () => {
-    const exists = await db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'").first();
-    if (exists) return;
-    const statements = schemaSql
-      .split('\n')
-      .filter((line) => !line.trim().startsWith('--'))
-      .join('\n')
-      .split(';')
-      .map((sql) => sql.replace(/\s+--[^'\n]*$/gm, '').trim())
-      .filter(Boolean)
-      .map((sql) => db.prepare(sql));
-    await db.batch(statements);
+    const { results } = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
+    const tables = new Set(results.map((r) => r.name));
+    for (const m of MIGRATIONS) {
+      if (tables.has(m.table)) continue;
+      await db.batch(sqlStatements(m.sql).map((sql) => db.prepare(sql)));
+    }
   })().catch((err) => {
     schemaReady = null; // retry on the next request
     throw err;
@@ -80,6 +92,10 @@ async function route(request, env, url) {
     if (method === 'POST') return setup(request, db);
   }
   if (parts[0] === 'login' && method === 'POST') return login(request, db);
+  if (parts[0] === 'invite' && parts.length === 1) {
+    if (method === 'GET') return readInvite(db, url.searchParams.get('token'));
+    if (method === 'POST') return acceptInvite(request, db);
+  }
   if (parts[0] === 'logout' && method === 'POST') return logout(request, db);
 
   // Everything else needs a signed-in user
@@ -136,7 +152,8 @@ async function route(request, env, url) {
 
     if (resource === 'users') {
       if (!sub && method === 'GET') return listUsers(db);
-      if (!sub && method === 'POST') return createUser(request, db);
+      if (!sub && method === 'POST') return createUser(request, db, url);
+      if (id && parts[3] === 'invite' && method === 'POST') return json({ inviteUrl: await createInvite(db, id, url) });
       if (id && method === 'PUT') return updateUser(request, db, user, id);
     }
   }
@@ -180,7 +197,7 @@ function requireAdmin(user) {
 }
 
 function publicUser(u) {
-  return { id: u.id, name: u.name, email: u.email, role: u.role, active: !!u.active };
+  return { id: u.id, name: u.name, email: u.email, role: u.role, active: !!u.active, pending: u.password_hash === '' };
 }
 
 function parseJson(text, fallback) {
@@ -240,10 +257,8 @@ async function verifyPassword(password, stored) {
 }
 
 function validatePassword(password) {
-  if (typeof password !== 'string' || password.length < 8) {
-    throw new HttpError(400, 'Password must be at least 8 characters.');
-  }
-  if (password.length > 200) throw new HttpError(400, 'Password is too long.');
+  if (typeof password !== 'string' || password.length === 0) throw new HttpError(400, 'Please enter a password.');
+  if (password.length > 1000) throw new HttpError(400, 'Password is too long.');
 }
 
 async function sha256(text) {
@@ -264,9 +279,13 @@ function sessionCookie(token, maxAgeSeconds) {
   return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
 }
 
-async function startSession(db, userId) {
+function randomToken() {
   const raw = crypto.getRandomValues(new Uint8Array(32));
-  const token = b64(raw).replace(/[+/=]/g, (c) => ({ '+': '-', '/': '_', '=': '' })[c]);
+  return b64(raw).replace(/[+/=]/g, (c) => ({ '+': '-', '/': '_', '=': '' })[c]);
+}
+
+async function startSession(db, userId) {
+  const token = randomToken();
   const now = Date.now();
   await db.batch([
     db.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(now),
@@ -347,6 +366,54 @@ async function changeOwnPassword(request, db, user) {
   validatePassword(body.password);
   await db.batch([
     db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').bind(await hashPassword(body.password), user.id),
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').bind(user.id),
+  ]);
+  const cookie = await startSession(db, user.id);
+  return json({ ok: true }, 200, { 'set-cookie': cookie });
+}
+
+// ---------------------------------------------------------------------------
+// Invite / password links
+
+async function createInvite(db, userId, url) {
+  const user = await db.prepare('SELECT id FROM users WHERE id = ?').bind(userId).first();
+  if (!user) throw new HttpError(404, 'User not found.');
+  const token = randomToken();
+  await db.batch([
+    db.prepare('DELETE FROM invites WHERE user_id = ? OR expires_at < ?').bind(userId, Date.now()),
+    db.prepare('INSERT INTO invites (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
+      .bind(await sha256(token), userId, Date.now() + INVITE_TTL_MS),
+  ]);
+  // The token goes after '#' so it is never sent to the server in request logs or referrers.
+  return `${url.origin}/#invite=${token}`;
+}
+
+async function findInvite(db, token) {
+  if (!token) throw new HttpError(400, 'This link is missing its code.');
+  const row = await db
+    .prepare(
+      `SELECT u.* FROM invites i JOIN users u ON u.id = i.user_id
+       WHERE i.token_hash = ? AND i.expires_at > ? AND u.active = 1`
+    )
+    .bind(await sha256(token), Date.now())
+    .first();
+  if (!row) throw new HttpError(404, 'This link has expired or already been used. Ask an admin for a new one.');
+  return row;
+}
+
+async function readInvite(db, token) {
+  const user = await findInvite(db, token);
+  return json({ name: user.name, email: user.email, isNew: user.password_hash === '' });
+}
+
+async function acceptInvite(request, db) {
+  const body = await readJson(request);
+  const user = await findInvite(db, body.token);
+  validatePassword(body.password);
+  await db.batch([
+    db.prepare('UPDATE users SET password_hash = ?, failed_logins = 0, locked_until = NULL WHERE id = ?')
+      .bind(await hashPassword(body.password), user.id),
+    db.prepare('DELETE FROM invites WHERE user_id = ?').bind(user.id),
     db.prepare('DELETE FROM sessions WHERE user_id = ?').bind(user.id),
   ]);
   const cookie = await startSession(db, user.id);
@@ -496,6 +563,41 @@ function mergeData(fields, existing, incoming, partial) {
   return data;
 }
 
+// Load everything an enquiry write needs in a single database round trip.
+async function loadWriteContext(db, enquiryId) {
+  const statements = [
+    db.prepare('SELECT * FROM fields WHERE archived = 0 ORDER BY position, id'),
+    db.prepare('SELECT id, name, position FROM stages ORDER BY position, id'),
+    db.prepare('SELECT id, name FROM users'),
+  ];
+  if (enquiryId) statements.push(db.prepare(`${ENQUIRY_SELECT} WHERE e.id = ?`).bind(enquiryId));
+  const [fields, stages, users, enquiry] = await db.batch(statements);
+  const ctx = {
+    fields: fields.results.map(rowToField),
+    stages: stages.results,
+    users: users.results,
+  };
+  if (enquiryId) {
+    if (!enquiry.results.length) throw new HttpError(404, 'Enquiry not found.');
+    ctx.existing = rowToEnquiry(enquiry.results[0]);
+  }
+  return ctx;
+}
+
+function pickStage(ctx, stageId) {
+  if (stageId === null || stageId === undefined || stageId === '') return null;
+  const stage = ctx.stages.find((s) => s.id === Number(stageId));
+  if (!stage) throw new HttpError(400, 'Unknown stage.');
+  return stage.id;
+}
+
+function pickUser(ctx, userId) {
+  if (userId === null || userId === undefined || userId === '') return null;
+  const user = ctx.users.find((u) => u.id === Number(userId));
+  if (!user) throw new HttpError(400, 'Unknown staff member.');
+  return user.id;
+}
+
 async function resolveStage(db, stageId) {
   if (stageId === null || stageId === undefined || stageId === '') return null;
   const row = await db.prepare('SELECT id FROM stages WHERE id = ?').bind(Number(stageId)).first();
@@ -503,30 +605,21 @@ async function resolveStage(db, stageId) {
   return row.id;
 }
 
-async function resolveAssignee(db, userId) {
-  if (userId === null || userId === undefined || userId === '') return null;
-  const row = await db.prepare('SELECT id FROM users WHERE id = ?').bind(Number(userId)).first();
-  if (!row) throw new HttpError(400, 'Unknown staff member.');
-  return row.id;
-}
-
 async function createEnquiry(request, db, user) {
   const body = await readJson(request);
-  const fields = await loadFields(db);
-  const data = mergeData(fields, {}, body.data || {}, false);
-  let stageId = await resolveStage(db, body.stage_id);
-  if (stageId === null) {
-    const first = await db.prepare('SELECT id FROM stages ORDER BY position, id LIMIT 1').first();
-    stageId = first ? first.id : null;
-  }
-  const assignee = await resolveAssignee(db, body.assigned_to);
-  const result = await db
-    .prepare('INSERT INTO enquiries (stage_id, data, assigned_to, created_by, updated_by) VALUES (?, ?, ?, ?, ?)')
-    .bind(stageId, JSON.stringify(data), assignee, user.id, user.id)
-    .run();
-  const id = result.meta.last_row_id;
-  await logActivity(db, id, user.id, 'created', 'Enquiry created');
-  return json({ enquiry: await fetchEnquiry(db, id) }, 201);
+  const ctx = await loadWriteContext(db);
+  const data = mergeData(ctx.fields, {}, body.data || {}, false);
+  const stageId = pickStage(ctx, body.stage_id) ?? ctx.stages[0]?.id ?? null;
+  const assignee = pickUser(ctx, body.assigned_to);
+  // Insert the enquiry and its first history entry together (one round trip, one transaction).
+  const [inserted] = await db.batch([
+    db.prepare('INSERT INTO enquiries (stage_id, data, assigned_to, created_by, updated_by) VALUES (?, ?, ?, ?, ?) RETURNING *')
+      .bind(stageId, JSON.stringify(data), assignee, user.id, user.id),
+    db.prepare("INSERT INTO activity (enquiry_id, user_id, kind, message) VALUES (last_insert_rowid(), ?, 'created', 'Enquiry created')")
+      .bind(user.id),
+  ]);
+  const row = inserted.results[0];
+  return json({ enquiry: rowToEnquiry({ ...row, created_by_name: user.name, updated_by_name: user.name }) }, 201);
 }
 
 function formatForLog(field, value) {
@@ -537,11 +630,11 @@ function formatForLog(field, value) {
 
 async function updateEnquiry(request, db, user, id, partial) {
   const body = await readJson(request);
-  const existing = await fetchEnquiry(db, id);
-  const fields = await loadFields(db);
+  const ctx = await loadWriteContext(db, id);
+  const { existing, fields } = ctx;
   const data = body.data ? mergeData(fields, existing.data, body.data, partial) : existing.data;
-  const stageId = 'stage_id' in body ? await resolveStage(db, body.stage_id) : existing.stage_id;
-  const assignee = 'assigned_to' in body ? await resolveAssignee(db, body.assigned_to) : existing.assigned_to;
+  const stageId = 'stage_id' in body ? pickStage(ctx, body.stage_id) : existing.stage_id;
+  const assignee = 'assigned_to' in body ? pickUser(ctx, body.assigned_to) : existing.assigned_to;
 
   const changes = [];
   for (const field of fields) {
@@ -553,24 +646,24 @@ async function updateEnquiry(request, db, user, id, partial) {
     }
   }
   if (stageId !== existing.stage_id) {
-    const names = Object.fromEntries((await loadStages(db)).map((s) => [s.id, s.name]));
-    changes.push(`Stage: ${names[existing.stage_id] || '(none)'} → ${names[stageId] || '(none)'}`);
+    const name = (sid) => ctx.stages.find((s) => s.id === sid)?.name || '(none)';
+    changes.push(`Stage: ${name(existing.stage_id)} → ${name(stageId)}`);
   }
   if (assignee !== existing.assigned_to) {
-    const row = assignee ? await db.prepare('SELECT name FROM users WHERE id = ?').bind(assignee).first() : null;
-    changes.push(`Assigned to: ${row ? row.name : '(nobody)'}`);
+    changes.push(`Assigned to: ${ctx.users.find((u) => u.id === assignee)?.name || '(nobody)'}`);
   }
 
-  if (changes.length) {
-    await db
-      .prepare(
-        "UPDATE enquiries SET data = ?, stage_id = ?, assigned_to = ?, updated_by = ?, updated_at = datetime('now') WHERE id = ?"
-      )
-      .bind(JSON.stringify(data), stageId, assignee, user.id, id)
-      .run();
-    await logActivity(db, id, user.id, 'updated', changes.join('\n'));
-  }
-  return json({ enquiry: await fetchEnquiry(db, id) });
+  if (!changes.length) return json({ enquiry: existing });
+  // Save the change and its history entry together (one round trip, one transaction).
+  const [updated] = await db.batch([
+    db.prepare(
+      "UPDATE enquiries SET data = ?, stage_id = ?, assigned_to = ?, updated_by = ?, updated_at = datetime('now') WHERE id = ? RETURNING *"
+    ).bind(JSON.stringify(data), stageId, assignee, user.id, id),
+    db.prepare("INSERT INTO activity (enquiry_id, user_id, kind, message) VALUES (?, ?, 'updated', ?)")
+      .bind(id, user.id, changes.join('\n')),
+  ]);
+  const row = updated.results[0];
+  return json({ enquiry: rowToEnquiry({ ...row, created_by_name: existing.created_by_name, updated_by_name: user.name }) });
 }
 
 async function deleteEnquiry(db, id) {
@@ -760,21 +853,25 @@ async function listUsers(db) {
   return json({ users: results.map(publicUser) });
 }
 
-async function createUser(request, db) {
+async function createUser(request, db, url) {
   const body = await readJson(request);
   const name = str(body.name, 100);
   const email = str(body.email, 200).toLowerCase();
   const role = body.role === 'admin' ? 'admin' : 'staff';
   if (!name || !email.includes('@')) throw new HttpError(400, 'Name and a valid email are required.');
-  validatePassword(body.password);
+  // No password → the person sets their own via an invite link.
+  const usePassword = typeof body.password === 'string' && body.password !== '';
+  if (usePassword) validatePassword(body.password);
   if (await db.prepare('SELECT 1 FROM users WHERE email = ?').bind(email).first()) {
     throw new HttpError(409, 'Someone already has an account with that email.');
   }
-  await db
+  const result = await db
     .prepare('INSERT INTO users (email, name, role, password_hash) VALUES (?, ?, ?, ?)')
-    .bind(email, name, role, await hashPassword(body.password))
+    .bind(email, name, role, usePassword ? await hashPassword(body.password) : '')
     .run();
-  return listUsers(db);
+  const inviteUrl = usePassword ? null : await createInvite(db, result.meta.last_row_id, url);
+  const { results } = await db.prepare('SELECT * FROM users ORDER BY active DESC, name').all();
+  return json({ users: results.map(publicUser), inviteUrl });
 }
 
 async function updateUser(request, db, me, id) {

@@ -133,6 +133,8 @@ function stagePill(stage) {
 // Boot & auth
 
 async function boot() {
+  const invite = new URLSearchParams(location.hash.slice(1)).get('invite');
+  if (invite) return renderInvite(invite);
   try {
     const setup = await fetch('/api/setup').then((r) => r.json());
     document.title = setup.appName;
@@ -156,7 +158,6 @@ function authShell(title, subtitle, form) {
   $app.replaceChildren(
     h('div', { class: 'auth' },
       h('div', { class: 'auth-card' },
-        h('div', { class: 'ring' }, '💍'),
         h('h1', {}, title),
         subtitle && h('p', { class: 'muted', style: { textAlign: 'center', margin: 0 } }, subtitle),
         form))
@@ -170,7 +171,8 @@ function renderAuth() {
     h('label', { class: 'field' }, 'Email', h('input', { name: 'email', type: 'email', required: true, autocomplete: 'username' })),
     h('label', { class: 'field' }, 'Password', h('input', { name: 'password', type: 'password', required: true, autocomplete: 'current-password' })),
     err,
-    h('button', { class: 'primary', type: 'submit' }, 'Sign in'));
+    h('button', { class: 'primary', type: 'submit' }, 'Sign in'),
+    h('p', { class: 'muted small', style: { textAlign: 'center', margin: 0 } }, 'Forgotten your password? Ask an admin to send you a reset link.'));
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     err.classList.add('hidden');
@@ -186,12 +188,56 @@ function renderAuth() {
   authShell(document.title || 'Wedding Enquiries', 'Sign in to manage enquiries', form);
 }
 
+async function renderInvite(token) {
+  const goToSignIn = () => {
+    history.replaceState(null, '', location.pathname);
+    boot();
+  };
+  let info;
+  try {
+    info = await api(`invite?token=${encodeURIComponent(token)}`);
+  } catch (ex) {
+    const box = h('div', { style: { display: 'flex', flexDirection: 'column', gap: '14px' } },
+      h('div', { class: 'error' }, ex.message),
+      h('button', { class: 'primary', onclick: goToSignIn }, 'Go to sign in'));
+    return authShell(document.title || 'Wedding Enquiries', null, box);
+  }
+  const err = h('div', { class: 'error hidden' });
+  const form = h('form', { style: { display: 'flex', flexDirection: 'column', gap: '14px' } },
+    h('label', { class: 'field' }, 'Email', h('input', { type: 'email', value: info.email, disabled: true, autocomplete: 'username' })),
+    h('label', { class: 'field' }, info.isNew ? 'Choose a password' : 'New password',
+      h('input', { name: 'password', type: 'password', required: true, autocomplete: 'new-password' })),
+    h('label', { class: 'field' }, 'Type it again', h('input', { name: 'confirm', type: 'password', required: true, autocomplete: 'new-password' })),
+    err,
+    h('button', { class: 'primary', type: 'submit' }, info.isNew ? 'Create my account' : 'Save new password'));
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    err.classList.add('hidden');
+    if (form.password.value !== form.confirm.value) {
+      err.textContent = "The two passwords don't match.";
+      return err.classList.remove('hidden');
+    }
+    try {
+      await api('invite', { method: 'POST', body: { token, password: form.password.value } });
+      history.replaceState(null, '', location.pathname);
+      await loadAll();
+      renderApp();
+      toast(info.isNew ? `Welcome, ${info.name}!` : 'Password updated');
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.classList.remove('hidden');
+    }
+  });
+  authShell(`Hi ${info.name}`, info.isNew ? 'Choose a password to finish setting up your account.' : 'Choose a new password.', form);
+  form.password.focus();
+}
+
 function renderSetup(appName) {
   const err = h('div', { class: 'error hidden' });
   const form = h('form', { style: { display: 'flex', flexDirection: 'column', gap: '14px' } },
     h('label', { class: 'field' }, 'Your name', h('input', { name: 'name', required: true })),
     h('label', { class: 'field' }, 'Email', h('input', { name: 'email', type: 'email', required: true, autocomplete: 'username' })),
-    h('label', { class: 'field' }, 'Password (8+ characters)', h('input', { name: 'password', type: 'password', required: true, minLength: 8, autocomplete: 'new-password' })),
+    h('label', { class: 'field' }, 'Password', h('input', { name: 'password', type: 'password', required: true, autocomplete: 'new-password' })),
     err,
     h('button', { class: 'primary', type: 'submit' }, 'Create admin account'));
   form.addEventListener('submit', async (e) => {
@@ -233,13 +279,72 @@ function renderApp() {
     h('nav', { class: 'tabs' }, tabs.map(([key, label]) =>
       h('button', { class: state.view === key ? 'active' : '', onclick: () => setView(key) }, label))),
     h('div', { class: 'user-menu' },
+      h('span', { id: 'sync-status', class: 'muted small' }),
       h('span', {}, me.name),
       h('span', { class: 'role-badge' }, me.role),
       h('button', { class: 'ghost', onclick: openPasswordModal }, 'Password'),
       h('button', { class: 'ghost', onclick: signOut }, 'Sign out')));
 
   const views = { list: renderList, board: renderBoard, summary: renderSummary, admin: renderAdmin };
-  $app.replaceChildren(header, h('main', {}, views[state.view]()));
+  const wide = state.view === 'list' || state.view === 'board';
+  $app.replaceChildren(header, h('main', { class: wide ? 'wide' : '' }, views[state.view]()));
+  updateSyncStatus();
+}
+
+// ---------------------------------------------------------------------------
+// Background saving: the screen updates instantly and the database catches up behind it.
+// Saves for the same enquiry run in order, so a quick drag-then-tick never arrives out of order.
+
+const saveQueues = new WeakMap();
+const queuedCount = new WeakMap();
+let pendingSaves = 0;
+
+function updateSyncStatus() {
+  const el = document.getElementById('sync-status');
+  if (el) el.textContent = pendingSaves ? 'Saving…' : '';
+}
+
+window.addEventListener('beforeunload', (e) => {
+  if (pendingSaves) e.preventDefault();
+});
+
+function queueSave(enquiry, task) {
+  const prev = saveQueues.get(enquiry) || Promise.resolve();
+  queuedCount.set(enquiry, (queuedCount.get(enquiry) || 0) + 1);
+  pendingSaves++;
+  updateSyncStatus();
+  const run = prev.then(task).catch(async (ex) => {
+    toast(`Couldn't save: ${ex.message}`, true);
+    await refreshEnquiries().catch(() => {});
+    renderApp();
+  }).finally(() => {
+    queuedCount.set(enquiry, queuedCount.get(enquiry) - 1);
+    pendingSaves--;
+    updateSyncStatus();
+  });
+  saveQueues.set(enquiry, run);
+  return run;
+}
+
+const whenSaved = (enquiry) => saveQueues.get(enquiry) || Promise.resolve();
+
+// Copy what the server saved, unless newer local changes are still waiting to go out.
+function settle(enquiry, saved) {
+  const { data, stage_id, assigned_to, ...meta } = saved;
+  Object.assign(enquiry, meta);
+  if (queuedCount.get(enquiry) <= 1) Object.assign(enquiry, { data, stage_id, assigned_to });
+}
+
+function applyLocal(enquiry, body) {
+  if ('stage_id' in body) enquiry.stage_id = body.stage_id;
+  if ('assigned_to' in body) enquiry.assigned_to = body.assigned_to;
+  if (body.data) {
+    enquiry.data = { ...enquiry.data };
+    for (const [k, v] of Object.entries(body.data)) {
+      if (v === '' || v === null || v === undefined) delete enquiry.data[k];
+      else enquiry.data[k] = v;
+    }
+  }
 }
 
 async function signOut() {
@@ -358,19 +463,19 @@ function tickChip(enquiry, field) {
   }, (on ? '✓ ' : '') + field.label);
 }
 
-async function quickUpdate(enquiry, body) {
-  try {
-    const { enquiry: updated } = await api(`enquiries/${enquiry.id}`, { method: 'PATCH', body });
-    Object.assign(enquiry, updated);
-    toast('Saved');
-  } catch (ex) {
-    toast(ex.message, true);
-  }
+function quickUpdate(enquiry, body) {
+  applyLocal(enquiry, body);
   renderApp();
+  queueSave(enquiry, async () => {
+    const { enquiry: saved } = await api(`enquiries/${enquiry.id}`, { method: 'PATCH', body });
+    settle(enquiry, saved);
+  });
 }
 
 // ---------------------------------------------------------------------------
 // Board (drag cards between stages)
+
+let dragging = null;
 
 function renderBoard() {
   const rows = filteredEnquiries();
@@ -382,7 +487,7 @@ function renderBoard() {
     const body = h('div', { class: 'column-body' }, items.map((e) =>
       h('div', {
         class: 'board-card', draggable: 'true',
-        ondragstart: (ev) => ev.dataTransfer.setData('text/plain', String(e.id)),
+        ondragstart: (ev) => { dragging = e; ev.dataTransfer.setData('text/plain', ''); },
         onclick: () => openEnquiry(e),
       },
         h('div', { class: 'title' }, titleOf(e)),
@@ -400,7 +505,8 @@ function renderBoard() {
     col.addEventListener('drop', (ev) => {
       ev.preventDefault();
       col.classList.remove('drag-over');
-      const e = state.enquiries.find((x) => x.id === Number(ev.dataTransfer.getData('text/plain')));
+      const e = dragging;
+      dragging = null;
       if (e && e.stage_id !== stage.id) quickUpdate(e, { stage_id: stage.id });
     });
     return col;
@@ -569,26 +675,39 @@ function openEnquiry(enquiry) {
     }
   });
 
-  const save = async () => {
+  const save = () => {
     err.classList.add('hidden');
     const body = readForm(form);
-    try {
-      if (isNew) {
-        const { enquiry: created } = await api('enquiries', { method: 'POST', body });
-        state.enquiries.unshift(created);
-        toast('Enquiry added');
-      } else {
-        const { enquiry: updated } = await api(`enquiries/${enquiry.id}`, { method: 'PUT', body });
-        Object.assign(enquiry, updated);
-        toast('Changes saved');
-      }
-      closeModal();
-      renderApp();
-    } catch (ex) {
-      err.textContent = ex.message;
+    const missing = activeFields().find((f) => f.required && (body.data[f.key] === '' || body.data[f.key] === false));
+    if (missing) {
+      err.textContent = `"${missing.label}" is required.`;
       err.classList.remove('hidden');
       err.scrollIntoView({ block: 'nearest' });
+      return;
     }
+    // Update the screen straight away; the database save happens in the background.
+    if (isNew) {
+      const draft = {
+        id: null, stage_id: body.stage_id ?? state.config.stages[0]?.id ?? null, assigned_to: body.assigned_to, data: {},
+        created_by_name: state.config.me.name, created_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+      };
+      applyLocal(draft, body);
+      state.enquiries.unshift(draft);
+      queueSave(draft, async () => {
+        const { enquiry: created } = await api('enquiries', { method: 'POST', body });
+        settle(draft, created);
+      });
+      toast('Enquiry added');
+    } else {
+      applyLocal(enquiry, body);
+      queueSave(enquiry, async () => {
+        const { enquiry: saved } = await api(`enquiries/${enquiry.id}`, { method: 'PUT', body });
+        settle(enquiry, saved);
+      });
+      toast('Changes saved');
+    }
+    closeModal();
+    renderApp();
   };
   form.addEventListener('submit', (e) => { e.preventDefault(); save(); });
 
@@ -624,16 +743,19 @@ function activityPanel(enquiry) {
     h('div', { class: 'activity-item' + (a.kind === 'note' ? ' note' : '') },
       h('div', { class: 'muted small' }, `${a.user_name || 'Someone'} · ${fmtDateTime(a.created_at)}${a.kind === 'note' ? ' · note' : ''}`),
       h('div', { class: 'msg' }, a.message))) : [h('span', { class: 'muted' }, 'No history yet.')]));
-  api(`enquiries/${enquiry.id}/activity`).then((r) => draw(r.activity)).catch(() => {});
+  whenSaved(enquiry).then(() => api(`enquiries/${enquiry.id}/activity`)).then((r) => draw(r.activity)).catch(() => {});
 
   const note = h('textarea', { placeholder: 'Add a note (phone call, follow-up, etc.)…' });
-  const addNote = async () => {
-    if (!note.value.trim()) return;
-    try {
-      const r = await api(`enquiries/${enquiry.id}/notes`, { method: 'POST', body: { message: note.value } });
-      note.value = '';
-      draw(r.activity);
-    } catch (ex) { toast(ex.message, true); }
+  const addNote = () => {
+    const message = note.value.trim();
+    if (!message) return;
+    note.value = '';
+    list.prepend(h('div', { class: 'activity-item note' },
+      h('div', { class: 'muted small' }, `${state.config.me.name} · just now · note`), h('div', { class: 'msg' }, message)));
+    queueSave(enquiry, async () => {
+      const r = await api(`enquiries/${enquiry.id}/notes`, { method: 'POST', body: { message } });
+      if (list.isConnected) draw(r.activity);
+    });
   };
   return h('div', { class: 'form-section' },
     h('h3', {}, 'Notes & history'),
@@ -642,15 +764,13 @@ function activityPanel(enquiry) {
     list);
 }
 
-async function deleteEnquiry(enquiry) {
+function deleteEnquiry(enquiry) {
   if (!confirm(`Delete "${titleOf(enquiry)}"? This can't be undone.`)) return;
-  try {
-    await api(`enquiries/${enquiry.id}`, { method: 'DELETE', body: {} });
-    state.enquiries = state.enquiries.filter((e) => e.id !== enquiry.id);
-    closeModal();
-    renderApp();
-    toast('Enquiry deleted');
-  } catch (ex) { toast(ex.message, true); }
+  state.enquiries = state.enquiries.filter((e) => e !== enquiry);
+  closeModal();
+  renderApp();
+  toast('Enquiry deleted');
+  queueSave(enquiry, () => api(`enquiries/${enquiry.id}`, { method: 'DELETE', body: {} }));
 }
 
 // ---------------------------------------------------------------------------
@@ -689,7 +809,7 @@ function openPasswordModal() {
   const err = h('div', { class: 'error hidden' });
   const form = h('form', { style: { display: 'flex', flexDirection: 'column', gap: '14px' } },
     h('label', { class: 'field' }, 'Current password', h('input', { name: 'current', type: 'password', required: true, autocomplete: 'current-password' })),
-    h('label', { class: 'field' }, 'New password (8+ characters)', h('input', { name: 'password', type: 'password', required: true, minLength: 8, autocomplete: 'new-password' })),
+    h('label', { class: 'field' }, 'New password', h('input', { name: 'password', type: 'password', required: true, autocomplete: 'new-password' })),
     err);
   const save = async () => {
     try {
@@ -905,13 +1025,47 @@ async function adminUsers() {
   const me = state.config.me;
   return [
     h('div', { class: 'head' }, h('h2', {}, 'Staff accounts'), h('button', { class: 'primary', onclick: () => openUserModal(null) }, '+ Add account')),
-    h('p', { class: 'muted' }, 'Staff can add and update enquiries. Admins can also change the form, workflow and accounts. Share the password with new staff, then they can change it from the “Password” button.'),
+    h('p', { class: 'muted' }, 'Staff can add and update enquiries. Admins can also change the form, workflow and accounts. When you add someone, you get a link to send them so they can choose their own password. Use “Get link” any time someone needs a new password.'),
     users.map((u) => h('div', { class: 'list-row' + (u.active ? '' : ' archived') },
       h('div', { class: 'grow' }, h('strong', {}, u.name, u.id === me.id ? ' (you)' : ''), h('div', { class: 'muted small' }, u.email)),
       h('span', { class: 'tag' }, u.role === 'admin' ? 'Admin' : 'Staff'),
+      u.pending ? h('span', { class: 'tag pending' }, 'Hasn’t set password yet') : null,
       u.active ? null : h('span', { class: 'tag' }, 'Deactivated'),
+      u.active && u.id !== me.id ? h('button', { onclick: () => sendLink(u) }, u.pending ? 'Get invite link' : 'Get password reset link') : null,
       h('button', { onclick: () => openUserModal(u) }, 'Edit'))),
   ];
+}
+
+async function sendLink(user) {
+  try {
+    const { inviteUrl } = await api(`admin/users/${user.id}/invite`, { method: 'POST', body: {} });
+    showLinkModal(user, inviteUrl, user.pending);
+    if (state.adminTab === 'users') renderApp();
+  } catch (ex) { toast(ex.message, true); }
+}
+
+function showLinkModal(user, url, isNew) {
+  const appName = state.config.appName;
+  const subject = isNew ? `Your ${appName} account` : `Reset your ${appName} password`;
+  const message = isNew
+    ? `Hi ${user.name},\n\nYou've been given an account for ${appName}. Open this link to choose your password:\n\n${url}\n\nThe link works once and expires in 7 days.`
+    : `Hi ${user.name},\n\nOpen this link to choose a new password for ${appName}:\n\n${url}\n\nThe link works once and expires in 7 days.`;
+  const input = h('input', { value: url, readOnly: true, onfocus: (e) => e.target.select() });
+  const copy = async (text, label) => {
+    try { await navigator.clipboard.writeText(text); toast(`${label} copied`); }
+    catch { input.select(); document.execCommand('copy'); toast(`${label} copied`); }
+  };
+  modal(isNew ? 'Send this link to ' + user.name : 'Password reset link for ' + user.name, [
+    h('p', { style: { margin: 0 } }, isNew
+      ? `Send this link to ${user.name} (${user.email}) however you like (email, text or chat). They open it and choose their own password.`
+      : `Send this link to ${user.name}. They open it and choose a new password. Their old password stops working once they do.`),
+    input,
+    h('p', { class: 'muted small', style: { margin: 0 } }, 'The link works once and expires in 7 days. You can always get a fresh one from Staff accounts.'),
+  ], [
+    h('a', { class: 'btn left', href: `mailto:${encodeURIComponent(user.email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(message)}` }, 'Open in email'),
+    h('button', { onclick: () => copy(message, 'Message') }, 'Copy message'),
+    h('button', { class: 'primary', onclick: () => copy(url, 'Link') }, 'Copy link'),
+  ], { narrow: true });
 }
 
 function openUserModal(user) {
@@ -919,26 +1073,43 @@ function openUserModal(user) {
   const u = user || { name: '', email: '', role: 'staff', active: true };
   const isMe = user && user.id === state.config.me.id;
   const err = h('div', { class: 'error hidden' });
+  const pwInput = h('input', { name: 'password', type: 'text', autocomplete: 'off' });
+  const pwField = h('label', { class: 'field' + (isNew ? ' hidden' : '') }, isNew ? 'Password' : 'Set a new password (leave blank to keep the current one)', pwInput);
+  const method = isNew ? h('div', { class: 'field' },
+    'How will they get their password?',
+    h('label', { class: 'check', style: { fontWeight: 400 } },
+      h('input', { type: 'radio', name: 'method', value: 'link', checked: true, onchange: () => pwField.classList.add('hidden') }),
+      'Send them a link to choose their own (recommended)'),
+    h('label', { class: 'check', style: { fontWeight: 400 } },
+      h('input', { type: 'radio', name: 'method', value: 'password', onchange: () => { pwField.classList.remove('hidden'); pwInput.focus(); } }),
+      'I’ll set a password for them now')) : null;
   const form = h('form', { style: { display: 'flex', flexDirection: 'column', gap: '14px' } },
     h('label', { class: 'field' }, 'Name', h('input', { name: 'name', value: u.name, required: true })),
     h('label', { class: 'field' }, 'Email (used to sign in)', h('input', { name: 'email', type: 'email', value: u.email, required: true })),
     h('label', { class: 'field' }, 'Role', h('select', { name: 'role', disabled: isMe },
-      h('option', { value: 'staff', selected: u.role === 'staff' }, 'Wedding staff'),
-      h('option', { value: 'admin', selected: u.role === 'admin' }, 'Admin'))),
-    h('label', { class: 'field' }, isNew ? 'Password (8+ characters)' : 'Reset password (leave blank to keep)',
-      h('input', { name: 'password', type: 'text', autocomplete: 'off', required: isNew, minLength: 8 })),
+      h('option', { value: 'staff', selected: u.role === 'staff' }, 'Wedding staff: can add and update enquiries'),
+      h('option', { value: 'admin', selected: u.role === 'admin' }, 'Admin: can also change settings and accounts'))),
+    method,
+    pwField,
     isNew || isMe ? null : h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: u.active }), 'Account active (untick to block sign-in)'),
     err);
   const save = async () => {
+    err.classList.add('hidden');
     const body = { name: form.name.value, email: form.email.value, role: form.role.value };
-    if (form.password.value) body.password = form.password.value;
+    const setPassword = !isNew || form.querySelector('input[name=method]:checked').value === 'password';
+    if (setPassword && pwInput.value) body.password = pwInput.value;
+    if (isNew && setPassword && !pwInput.value) {
+      err.textContent = 'Enter a password, or choose to send them a link instead.';
+      return err.classList.remove('hidden');
+    }
     if (form.active) body.active = form.active.checked;
     try {
-      await api(isNew ? 'admin/users' : `admin/users/${u.id}`, { method: isNew ? 'POST' : 'PUT', body });
+      const result = await api(isNew ? 'admin/users' : `admin/users/${u.id}`, { method: isNew ? 'POST' : 'PUT', body });
       closeModal();
       await refreshConfig();
       renderApp();
-      toast(isNew ? 'Account created' : 'Account updated');
+      if (result.inviteUrl) showLinkModal({ name: body.name, email: body.email }, result.inviteUrl, true);
+      else toast(isNew ? 'Account created' : 'Account updated');
     } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
   };
   form.addEventListener('submit', (e) => { e.preventDefault(); save(); });
@@ -955,5 +1126,10 @@ function adminGeneral() {
       h('button', { class: 'primary', onclick: () => adminAction(() => api('admin/settings', { method: 'PUT', body: { appName: input.value } }), 'Saved') }, 'Save')),
   ];
 }
+
+// Opening an invite link in a tab that already has the app open only changes the #hash.
+window.addEventListener('hashchange', () => {
+  if (new URLSearchParams(location.hash.slice(1)).get('invite')) boot();
+});
 
 boot();
